@@ -1,0 +1,731 @@
+name: Lambda CI/CD
+
+on:
+  push:
+    branches: [ dev, feature/lambda-cicd ]  # Added feature branch for testing
+    paths:
+      - 'src/lambda/**'
+  pull_request:
+    branches: [ dev ]
+    paths:
+      - 'src/lambda/**'
+  workflow_run:
+    workflows: ["Terraform CI/CD"]
+    types:
+      - completed
+    branches: [ dev ]
+
+jobs:
+  # Check if Terraform workflow completed successfully
+  check-terraform:
+    name: Check Terraform Completion
+    runs-on: self-hosted
+    if: github.event_name == 'workflow_run'
+    outputs:
+      terraform_success: ${{ steps.check.outputs.success }}
+    steps:
+      - name: Check Terraform workflow status
+        id: check
+        run: |
+          echo "Terraform workflow conclusion: ${{ github.event.workflow_run.conclusion }}"
+          if [ "${{ github.event.workflow_run.conclusion }}" == "success" ]; then
+            echo "Terraform completed successfully"
+            echo "success=true" >> $GITHUB_OUTPUT
+          else
+            echo "Terraform failed or was cancelled"
+            echo "success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  detect-changes:
+    name: Detect Lambda Changes
+    runs-on: self-hosted
+    needs: check-terraform
+    if: |
+      always() &&
+      (github.event_name == 'push' ||
+       github.event_name == 'pull_request' ||
+       (github.event_name == 'workflow_run' && needs.check-terraform.outputs.terraform_success == 'true'))
+    outputs:
+      lambda_ct: ${{ steps.filter.outputs.lambda_ct }}
+      lambda_market_data: ${{ steps.filter.outputs.lambda_market_data }}
+      lambda_loan_repayments: ${{ steps.filter.outputs.lambda_loan_repayments }}
+      lambda_loan_applications: ${{ steps.filter.outputs.lambda_loan_applications }}
+      lambda_credit_bureau: ${{ steps.filter.outputs.lambda_credit_bureau }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check for Lambda changes
+        uses: dorny/paths-filter@v2
+        id: filter
+        with:
+          filters: |
+            lambda_ct:
+              - 'src/lambda/lambda_CT_script/**'
+            lambda_market_data:
+              - 'src/lambda/lambda_market_data_script/**'
+            lambda_loan_repayments:
+              - 'src/lambda/lambda_loan_repayments/**'
+            lambda_loan_applications:
+              - 'src/lambda/lambda_loan_applications/**'
+            lambda_credit_bureau:
+              - 'src/lambda/lambda_credit_bureau_script/**'
+
+  # Job 1: Customer Transaction API Poller Lambda
+  build-lambda-ct:
+    name: Build Lambda - Customer Transactions
+    runs-on: self-hosted
+    needs: detect-changes
+    if: needs.detect-changes.outputs.lambda_ct == 'true'
+
+    env:
+      LAMBDA_NAME: credit-risk-dev-api-poller
+      LAMBDA_PATH: src/lambda/lambda_CT_script
+      PYTHON_VERSION: '3.11'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Install dependencies and build
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          chmod +x build-lambda.sh
+          ./build-lambda.sh
+
+      - name: Verify build output
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          if [ ! -f "dist/api_poller_lambda.zip" ]; then
+            echo "L Build failed - deployment package not found"
+            exit 1
+          fi
+          echo " Build successful"
+          ls -lh dist/api_poller_lambda.zip
+
+      # Upload artifact only for dev branch (production deployments)
+      # Skipped for feature branches to save storage quota
+      - name: Upload build artifact
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-ct-package
+          path: ${{ env.LAMBDA_PATH }}/dist/api_poller_lambda.zip
+          retention-days: 1
+
+  deploy-lambda-ct:
+    name: Deploy Lambda - Customer Transactions
+    runs-on: self-hosted
+    needs: build-lambda-ct
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/feature/lambda-cicd')
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: eu-west-1
+      LAMBDA_NAME: credit-risk-dev-api-poller
+      LAMBDA_PATH: src/lambda/lambda_CT_script
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          chmod +x build-lambda.sh
+          ./build-lambda.sh
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsLambdaDeploy
+
+      - name: Update Lambda function code
+        working-directory: ${{ env.LAMBDA_PATH }}/dist
+        run: |
+          echo "Deploying Lambda function: ${{ env.LAMBDA_NAME }}"
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://api_poller_lambda.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for update to complete
+        run: |
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          LAST_MODIFIED=$(aws lambda get-function \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Configuration.LastModified' \
+            --output text)
+
+          echo " Lambda deployed successfully"
+          echo "=� Function: ${{ env.LAMBDA_NAME }}"
+          echo "=P Last Modified: ${LAST_MODIFIED}"
+          echo "=d Deployed by: ${{ github.actor }}"
+
+  # Job 2: Market Data Lambda
+  build-lambda-market-data:
+    name: Build Lambda - Market Data
+    runs-on: self-hosted
+    needs: detect-changes
+    if: needs.detect-changes.outputs.lambda_market_data == 'true'
+
+    env:
+      LAMBDA_NAME: credit-risk-dev-market-data-poller
+      LAMBDA_PATH: src/lambda/lambda_market_data_script
+      PYTHON_VERSION: '3.11'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Install dependencies and build
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          chmod +x build-lambda.sh
+          ./build-lambda.sh
+
+      - name: Verify build output
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          if [ ! -f "dist/market_data_poller.zip" ]; then
+            echo "Build failed - deployment package not found"
+            exit 1
+          fi
+          echo "Build successful"
+          ls -lh dist/market_data_poller.zip
+
+      # Upload artifact only for dev branch (production deployments)
+      # Skipped for feature branches to save storage quota
+      - name: Upload build artifact
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-market-data-package
+          path: ${{ env.LAMBDA_PATH }}/dist/market_data_poller.zip
+          retention-days: 1
+
+  deploy-lambda-market-data:
+    name: Deploy Lambda - Market Data
+    runs-on: self-hosted
+    needs: build-lambda-market-data
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/feature/lambda-cicd')
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: eu-west-1
+      LAMBDA_NAME: credit-risk-dev-market-data-poller
+      LAMBDA_PATH: src/lambda/lambda_market_data_script
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          chmod +x build-lambda.sh
+          ./build-lambda.sh
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsLambdaDeploy
+
+      - name: Update Lambda function code
+        working-directory: ${{ env.LAMBDA_PATH }}/dist
+        run: |
+          echo "Deploying Lambda function: ${{ env.LAMBDA_NAME }}"
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://market_data_poller.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for update to complete
+        run: |
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          LAST_MODIFIED=$(aws lambda get-function \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Configuration.LastModified' \
+            --output text)
+
+          echo "Lambda deployed successfully"
+          echo "Function: ${{ env.LAMBDA_NAME }}"
+          echo "Last Modified: ${LAST_MODIFIED}"
+          echo "Deployed by: ${{ github.actor }}"
+
+  # Job 3: Loan Repayments Lambda
+  build-lambda-loan-repayments:
+    name: Build Lambda - Loan Repayments
+    runs-on: self-hosted
+    needs: detect-changes
+    if: needs.detect-changes.outputs.lambda_loan_repayments == 'true'
+
+    env:
+      LAMBDA_NAME: loan-repayments-validator-dev
+      LAMBDA_PATH: src/lambda/lambda_loan_repayments
+      PYTHON_VERSION: '3.11'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          mkdir -p dist
+          zip -j dist/loan_repayments_validator.zip lambda_function.py
+
+      - name: Verify build output
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          if [ ! -f "dist/loan_repayments_validator.zip" ]; then
+            echo "Build failed - deployment package not found"
+            exit 1
+          fi
+          echo "Build successful"
+          ls -lh dist/loan_repayments_validator.zip
+
+      - name: Upload build artifact
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-loan-repayments-package
+          path: ${{ env.LAMBDA_PATH }}/dist/loan_repayments_validator.zip
+          retention-days: 1
+
+  deploy-lambda-loan-repayments:
+    name: Deploy Lambda - Loan Repayments
+    runs-on: self-hosted
+    needs: build-lambda-loan-repayments
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/feature/lambda-cicd')
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: eu-west-1
+      LAMBDA_NAME: loan-repayments-validator-dev
+      LAMBDA_PATH: src/lambda/lambda_loan_repayments
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          mkdir -p dist
+          zip -j dist/loan_repayments_validator.zip lambda_function.py
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsLambdaDeploy
+
+      - name: Update Lambda function code
+        working-directory: ${{ env.LAMBDA_PATH }}/dist
+        run: |
+          echo "Deploying Lambda function: ${{ env.LAMBDA_NAME }}"
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://loan_repayments_validator.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for update to complete
+        run: |
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          LAST_MODIFIED=$(aws lambda get-function \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Configuration.LastModified' \
+            --output text)
+
+          echo "Lambda deployed successfully"
+          echo "Function: ${{ env.LAMBDA_NAME }}"
+          echo "Last Modified: ${LAST_MODIFIED}"
+          echo "Deployed by: ${{ github.actor }}"
+
+  # Job 4: Loan Applications Lambda
+  build-lambda-loan-applications:
+    name: Build Lambda - Loan Applications
+    runs-on: self-hosted
+    needs: detect-changes
+    if: needs.detect-changes.outputs.lambda_loan_applications == 'true'
+
+    env:
+      LAMBDA_NAME: loan-application-validator-dev
+      LAMBDA_PATH: src/lambda/lambda_loan_applications
+      PYTHON_VERSION: '3.11'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          mkdir -p dist
+          zip -j dist/loan_application_validator.zip lambda_function.py
+
+      - name: Verify build output
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          if [ ! -f "dist/loan_application_validator.zip" ]; then
+            echo "Build failed - deployment package not found"
+            exit 1
+          fi
+          echo "Build successful"
+          ls -lh dist/loan_application_validator.zip
+
+      - name: Upload build artifact
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-loan-applications-package
+          path: ${{ env.LAMBDA_PATH }}/dist/loan_application_validator.zip
+          retention-days: 1
+
+  deploy-lambda-loan-applications:
+    name: Deploy Lambda - Loan Applications
+    runs-on: self-hosted
+    needs: build-lambda-loan-applications
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/feature/lambda-cicd')
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: eu-west-1
+      LAMBDA_NAME: loan-application-validator-dev
+      LAMBDA_PATH: src/lambda/lambda_loan_applications
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          mkdir -p dist
+          zip -j dist/loan_application_validator.zip lambda_function.py
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsLambdaDeploy
+
+      - name: Update Lambda function code
+        working-directory: ${{ env.LAMBDA_PATH }}/dist
+        run: |
+          echo "Deploying Lambda function: ${{ env.LAMBDA_NAME }}"
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://loan_application_validator.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for update to complete
+        run: |
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          LAST_MODIFIED=$(aws lambda get-function \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Configuration.LastModified' \
+            --output text)
+
+          echo "Lambda deployed successfully"
+          echo "Function: ${{ env.LAMBDA_NAME }}"
+          echo "Last Modified: ${LAST_MODIFIED}"
+          echo "Deployed by: ${{ github.actor }}"
+
+  # Job 5: Credit Bureau Lambda
+  build-lambda-credit-bureau:
+    name: Build Lambda - Credit Bureau
+    runs-on: self-hosted
+    needs: detect-changes
+    if: needs.detect-changes.outputs.lambda_credit_bureau == 'true'
+
+    env:
+      LAMBDA_NAME: credit-bureau-validator-dev
+      LAMBDA_PATH: src/lambda/lambda_credit_bureau_script
+      PYTHON_VERSION: '3.11'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          mkdir -p dist
+          zip -j dist/credit_bureau_validator.zip lambda_function.py
+
+      - name: Verify build output
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          if [ ! -f "dist/credit_bureau_validator.zip" ]; then
+            echo "Build failed - deployment package not found"
+            exit 1
+          fi
+          echo "Build successful"
+          ls -lh dist/credit_bureau_validator.zip
+
+      - name: Upload build artifact
+        if: github.ref == 'refs/heads/dev'
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-credit-bureau-package
+          path: ${{ env.LAMBDA_PATH }}/dist/credit_bureau_validator.zip
+          retention-days: 1
+
+  deploy-lambda-credit-bureau:
+    name: Deploy Lambda - Credit Bureau
+    runs-on: self-hosted
+    needs: build-lambda-credit-bureau
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/feature/lambda-cicd')
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: eu-west-1
+      LAMBDA_NAME: credit-bureau-validator-dev
+      LAMBDA_PATH: src/lambda/lambda_credit_bureau_script
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install zip utility
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zip
+
+      - name: Build Lambda package
+        working-directory: ${{ env.LAMBDA_PATH }}
+        run: |
+          echo "Building Lambda deployment package for ${{ env.LAMBDA_NAME }}"
+          mkdir -p dist
+          zip -j dist/credit_bureau_validator.zip lambda_function.py
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsLambdaDeploy
+
+      - name: Update Lambda function code
+        working-directory: ${{ env.LAMBDA_PATH }}/dist
+        run: |
+          echo "Deploying Lambda function: ${{ env.LAMBDA_NAME }}"
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --zip-file fileb://credit_bureau_validator.zip \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for update to complete
+        run: |
+          echo "Waiting for Lambda update to complete..."
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Verify deployment
+        run: |
+          LAST_MODIFIED=$(aws lambda get-function \
+            --function-name ${{ env.LAMBDA_NAME }} \
+            --region ${{ env.AWS_REGION }} \
+            --query 'Configuration.LastModified' \
+            --output text)
+
+          echo "Lambda deployed successfully"
+          echo "Function: ${{ env.LAMBDA_NAME }}"
+          echo "Last Modified: ${LAST_MODIFIED}"
+          echo "Deployed by: ${{ github.actor }}"
+
+  notify-success:
+    name: Notify Success
+    runs-on: self-hosted
+    needs: [deploy-lambda-ct, deploy-lambda-market-data, deploy-lambda-loan-repayments, deploy-lambda-loan-applications, deploy-lambda-credit-bureau]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      (needs.deploy-lambda-ct.result == 'success' || needs.deploy-lambda-ct.result == 'skipped') &&
+      (needs.deploy-lambda-market-data.result == 'success' || needs.deploy-lambda-market-data.result == 'skipped') &&
+      (needs.deploy-lambda-loan-repayments.result == 'success' || needs.deploy-lambda-loan-repayments.result == 'skipped') &&
+      (needs.deploy-lambda-loan-applications.result == 'success' || needs.deploy-lambda-loan-applications.result == 'skipped') &&
+      (needs.deploy-lambda-credit-bureau.result == 'success' || needs.deploy-lambda-credit-bureau.result == 'skipped')
+
+    steps:
+      - name: Success notification
+        run: |
+          echo "All Lambda deployments completed successfully"
+          echo "<? Branch: ${{ github.ref_name }}"
+          echo "=d Deployed by: ${{ github.actor }}"
+          echo "Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "=Commit: ${{ github.sha }}"
+
+  notify-failure:
+    name: Notify Failure
+    runs-on: self-hosted
+    needs: [deploy-lambda-ct, deploy-lambda-market-data, deploy-lambda-loan-repayments, deploy-lambda-loan-applications, deploy-lambda-credit-bureau]
+    if: |
+      always() &&
+      github.event_name == 'push' &&
+      (needs.deploy-lambda-ct.result == 'failure' ||
+       needs.deploy-lambda-market-data.result == 'failure' ||
+       needs.deploy-lambda-loan-repayments.result == 'failure' ||
+       needs.deploy-lambda-loan-applications.result == 'failure' ||
+       needs.deploy-lambda-credit-bureau.result == 'failure')
+
+    steps:
+      - name: Failure notification
+        run: |
+          echo "L Lambda deployment failed"
+          echo "<? Branch: ${{ github.ref_name }}"
+          echo "=d Triggered by: ${{ github.actor }}"
+          echo " Timestamp: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          exit 1

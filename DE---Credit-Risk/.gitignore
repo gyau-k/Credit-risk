@@ -1,0 +1,52 @@
+terraform/envs/dev/.terraform
+
+terraform/envs/dev/.terraform.lock.hcl
+
+terraform/bootstrap/.terraform
+terraform/bootstrap/.terraform.lock.hcl
+
+terraform/envs/dev/ terraform.tfstate
+terraform/envs/dev/ terraform.tfstate.backup
+
+# Lambda build artifacts
+src/lambda/lambda_CT_script/build/
+src/lambda/lambda_CT_script/dist/
+src/lambda/lambda_market_data_script/build/
+src/lambda/lambda_market_data_script/dist/
+terraform/modules/lambda/**/*.zip
+src/lambda/lambda_market_data_transformer/build/
+src/lambda/lambda_market_data_transformer/dist/
+src/lambda/lambda_market_data_transformer/build/
+src/lambda/lambda_market_data_transformer/dist/
+src/lambda/lambda_market_data_transformer/build/
+src/lambda/lambda_market_data_transformer/dist/
+src/lambda/lambda_ct_transformation/build/
+src/lambda/lambda_ct_transformation/dist/
+src/lambda/lambda_transform_loan_applications/dist/
+src/lambda/lambda_transform_loan_applications/build/
+src/lambda/lambda_transform_loan_repayments/build/
+src/lambda/lambda_transform_loan_repayments/dist/
+src/lambda/lambda_transform_credit_bureau/build/
+src/lambda/lambda_transform_credit_bureau/dist/
+src/lambda/lambda_check_glue_status/build/
+src/lambda/lambda_check_glue_status/dist/
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+Credit Risk Sprint Plan.pdf
+Credit Risk.pdf
+docs/data_encryption_implementation_guide.md
+src/lambda/lambda_check_glue_status/lambda_check_glue_status.zip

@@ -1,0 +1,368 @@
+name: Terraform CI/CD
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - "terraform/**"
+  push:
+    branches: [dev]
+    paths:
+      - "terraform/**"
+
+env:
+  AWS_REGION: eu-west-1
+  TERRAFORM_VERSION: 1.7.5
+  TF_ENV: dev
+  PLAN_BUCKET: credit-risk-github-actions-store
+
+jobs:
+  terraform-plan:
+    name: Terraform Plan
+    runs-on: self-hosted
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate environment
+        run: |
+          [ -d "terraform/envs/$TF_ENV" ] || {
+            echo " Environment 'terraform/envs/$TF_ENV' does not exist"
+            ls -la terraform/envs/
+            exit 1
+          }
+
+      - name: Setup Python & pip
+        run: |
+          echo "=========================================="
+          echo "Setting up Python environment..."
+          echo "=========================================="
+
+          # Install Python3 if needed
+          command -v python3 &> /dev/null || {
+            echo "Installing Python3..."
+            sudo apt-get update && sudo apt-get install -y python3
+          }
+
+          # Install pip3 if needed
+          command -v pip3 &> /dev/null || {
+            echo "Installing pip3..."
+            if command -v apt-get &> /dev/null; then
+              sudo apt-get update && sudo apt-get install -y python3-pip
+            elif command -v yum &> /dev/null; then
+              sudo yum install -y python3-pip
+            else
+              echo "Cannot install pip - unsupported OS"
+              exit 1
+            fi
+          }
+
+          python3 --version
+          pip3 --version
+          echo " Python environment ready"
+
+      - name: Build Lambda packages
+        shell: bash {0}
+        run: |
+          echo "=========================================="
+          echo "Auto-discovering Lambda packages..."
+          echo "=========================================="
+
+          REPO_ROOT="$(pwd)"
+          LAMBDA_DIRS=$(find src/lambda -type f -name "build-lambda.sh" -exec dirname {} \; | sort)
+
+          [ -z "$LAMBDA_DIRS" ] && {
+            echo " No Lambda packages found, skipping..."
+            exit 0
+          }
+
+          BUILD_SUCCESS=true
+          BUILT_COUNT=0
+          FAILED_LAMBDAS=()
+          TOTAL_COUNT=$(echo "$LAMBDA_DIRS" | wc -l)
+
+          echo "Found $TOTAL_COUNT Lambda package(s) to build"
+          echo ""
+
+          while IFS= read -r LAMBDA_DIR; do
+            LAMBDA_NAME=$(basename "$LAMBDA_DIR")
+            echo "=========================================="
+            echo " Building $LAMBDA_NAME..."
+            echo "=========================================="
+            
+            cd "$REPO_ROOT/$LAMBDA_DIR"
+            chmod +x build-lambda.sh
+            
+            BUILD_LOG="/tmp/${LAMBDA_NAME}_build.log"
+            bash build-lambda.sh > "$BUILD_LOG" 2>&1
+            BUILD_EXIT_CODE=$?
+            
+            echo "--- Build Output ---"
+            cat "$BUILD_LOG"
+            echo "--- End Output ---"
+            echo ""
+            
+            if [ $BUILD_EXIT_CODE -eq 0 ] && [ -d "build" ] && [ -n "$(ls -A build 2>/dev/null)" ]; then
+              FILE_COUNT=$(ls -1 build 2>/dev/null | wc -l)
+              BUILD_SIZE=$(du -sh build 2>/dev/null | cut -f1 || echo "N/A")
+              echo "    $LAMBDA_NAME: Success ($FILE_COUNT files, $BUILD_SIZE)"
+              ((BUILT_COUNT++))
+            else
+              echo "    $LAMBDA_NAME: Failed (exit code: $BUILD_EXIT_CODE)"
+              BUILD_SUCCESS=false
+              FAILED_LAMBDAS+=("$LAMBDA_NAME")
+            fi
+            
+            rm -f "$BUILD_LOG"
+            cd "$REPO_ROOT"
+            echo ""
+          done <<< "$LAMBDA_DIRS"
+
+          echo "=========================================="
+          echo "Build Summary: $BUILT_COUNT/$TOTAL_COUNT successful"
+          echo "=========================================="
+
+          if [ "$BUILD_SUCCESS" = true ] && [ $BUILT_COUNT -eq $TOTAL_COUNT ]; then
+            echo " All Lambda packages built successfully"
+          else
+            echo "Failed builds: ${FAILED_LAMBDAS[*]}"
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsPlan
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform format, init & validate
+        working-directory: terraform/envs/${{ env.TF_ENV }}
+        run: |
+          terraform fmt -check -recursive
+          terraform init -input=false
+          terraform validate
+
+      - name: Terraform plan
+        id: plan
+        working-directory: terraform/envs/${{ env.TF_ENV }}
+        run: |
+          set +e
+          terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+          PLAN_EXIT_CODE=$?
+          set -e
+
+          echo "exit_code=$PLAN_EXIT_CODE" >> $GITHUB_OUTPUT
+
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            echo "Terraform plan failed"
+            echo "PLAN_STATUS=failed" >> $GITHUB_ENV
+            exit $PLAN_EXIT_CODE
+          fi
+
+          echo " Terraform plan succeeded"
+          echo "PLAN_STATUS=success" >> $GITHUB_ENV
+
+      - name: Upload plan to S3
+        if: steps.plan.outputs.exit_code == '0'
+        working-directory: terraform/envs/${{ env.TF_ENV }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number }}"
+          S3_PATH="s3://$PLAN_BUCKET/terraform-plans/$TF_ENV/pr-$PR_NUMBER"
+
+          aws s3 cp tfplan "$S3_PATH/tfplan"
+          aws s3 cp plan.txt "$S3_PATH/plan.txt"
+
+          echo "${{ github.event.pull_request.head.sha }}" | aws s3 cp - "$S3_PATH/commit_sha.txt"
+          echo "$PR_NUMBER" | aws s3 cp - "$S3_PATH/pr_number.txt"
+
+          echo " Plan uploaded to: $S3_PATH/"
+
+      - name: Comment on PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planPath = 'terraform/envs/${{ env.TF_ENV }}/plan.txt';
+            const planStatus = '${{ env.PLAN_STATUS }}';
+            const prNumber = '${{ github.event.pull_request.number }}';
+            const commitSha = '${{ github.event.pull_request.head.sha }}';
+
+            let plan = '';
+            try {
+              plan = fs.readFileSync(planPath, 'utf8');
+              if (plan.length > 65000) {
+                plan = '...truncated (showing last 65000 chars)...\n' + plan.substring(plan.length - 65000);
+              }
+            } catch (error) {
+              plan = 'Unable to read plan output';
+            }
+
+            const output = planStatus === 'failed'
+              ? `## Terraform Plan Failed for \`${{ env.TF_ENV }}\`
+
+            <details><summary>Show Error</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+            </details>
+
+            **Plan failed and was NOT uploaded to S3**
+
+              PR #${prNumber} | Commit: \`${commitSha.substring(0, 7)}\` | Author: @${{ github.actor }}`
+              : `##  Terraform Plan for \`${{ env.TF_ENV }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`terraform
+            ${plan}
+            \`\`\`
+            </details>
+
+              Plan in S3: \`s3://${{ env.PLAN_BUCKET }}/terraform-plans/${{ env.TF_ENV }}/pr-${prNumber}/\`
+              PR #${prNumber} | Commit: \`${commitSha.substring(0, 7)}\` | @${{ github.actor }}`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            });
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: self-hosted
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Validate environment
+        run: |
+          [ -d "terraform/envs/$TF_ENV" ] || {
+            echo " Environment 'terraform/envs/$TF_ENV' does not exist"
+            exit 1
+          }
+
+      - name: Setup Python & pip
+        run: |
+          command -v python3 &> /dev/null || sudo apt-get update && sudo apt-get install -y python3
+          command -v pip3 &> /dev/null || {
+            if command -v apt-get &> /dev/null; then
+              sudo apt-get update && sudo apt-get install -y python3-pip
+            elif command -v yum &> /dev/null; then
+              sudo yum install -y python3-pip
+            fi
+          }
+          python3 --version && pip3 --version
+
+      - name: Build Lambda packages
+        shell: bash {0}
+        run: |
+          REPO_ROOT="$(pwd)"
+          LAMBDA_DIRS=$(find src/lambda -type f -name "build-lambda.sh" -exec dirname {} \; | sort)
+
+          [ -z "$LAMBDA_DIRS" ] && exit 0
+
+          TOTAL=$(echo "$LAMBDA_DIRS" | wc -l)
+          echo "Building $TOTAL Lambda package(s)..."
+
+          while IFS= read -r DIR; do
+            NAME=$(basename "$DIR")
+            echo " Building $NAME..."
+            cd "$REPO_ROOT/$DIR"
+            chmod +x build-lambda.sh && bash build-lambda.sh
+            cd "$REPO_ROOT"
+          done <<< "$LAMBDA_DIRS"
+
+          echo " All Lambda packages built"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.OIDC_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubActionsApply
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+
+      - name: Terraform init
+        working-directory: terraform/envs/${{ env.TF_ENV }}
+        run: terraform init -input=false
+
+      - name: Download plan from S3 and recreate
+        id: plan
+        working-directory: terraform/envs/${{ env.TF_ENV }}
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          PR_NUMBER=$(echo "$COMMIT_MSG" | grep -oP 'Merge pull request #\K\d+|(?<=\(#)\d+(?=\))' | head -1)
+
+          if [ -n "$PR_NUMBER" ]; then
+            S3_PATH="s3://$PLAN_BUCKET/terraform-plans/$TF_ENV/pr-$PR_NUMBER"
+            
+            # Download the plan text for reference
+            if aws s3 ls "$S3_PATH/plan.txt"; then
+              aws s3 cp "$S3_PATH/plan.txt" plan_reference.txt
+              echo " Downloaded plan reference for PR #$PR_NUMBER"
+              echo ""
+              echo "=========================================="
+              echo "ORIGINAL PLAN (for reference):"
+              echo "=========================================="
+              cat plan_reference.txt
+              echo "=========================================="
+              echo ""
+            fi
+            
+            # Always create a fresh plan to ensure Lambda ZIPs exist
+            echo "Creating fresh plan with current build artifacts..."
+            terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+            echo "plan_source=fresh" >> $GITHUB_OUTPUT
+          else
+            echo "  Not a PR merge, creating new plan..."
+            terraform plan -input=false -no-color -out=tfplan | tee plan.txt
+            echo "plan_source=new" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Terraform apply
+        working-directory: terraform/envs/${{ env.TF_ENV }}
+        run: |
+          echo "==================================="
+          echo "TERRAFORM PLAN TO APPLY"
+          echo "==================================="
+          cat plan.txt
+          echo "==================================="
+          echo ""
+          terraform apply -auto-approve tfplan
+          echo " Apply completed successfully"
+
+      - name: Cleanup S3 plan
+        if: always()
+        run: |
+          COMMIT_MSG="${{ github.event.head_commit.message }}"
+          PR_NUMBER=$(echo "$COMMIT_MSG" | grep -oP 'Merge pull request #\K\d+|(?<=\(#)\d+(?=\))' | head -1)
+
+          if [ -n "$PR_NUMBER" ]; then
+            aws s3 rm "s3://$PLAN_BUCKET/terraform-plans/$TF_ENV/pr-$PR_NUMBER/" --recursive
+            echo "  Cleaned up plan for PR #$PR_NUMBER"
+          fi

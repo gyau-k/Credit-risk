@@ -1,0 +1,314 @@
+{
+    "Comment": "Credit Risk Bronze to Gold Transformation Workflow - Routes files to appropriate Lambda, checks Glue job availability, and executes KPI generation",
+    "StartAt": "DetermineFileType",
+    "States": {
+      "DetermineFileType": {
+        "Type": "Choice",
+        "Comment": "Route to appropriate transformation Lambda based on S3 file path",
+        "Choices": [
+          {
+            "Variable": "$.detail.object.key",
+            "StringMatches": "loan_applications/raw/*",
+            "Next": "TransformLoanApplications"
+          },
+          {
+            "Variable": "$.detail.object.key",
+            "StringMatches": "credit_bureau/raw/*",
+            "Next": "TransformCreditBureau"
+          },
+          {
+            "Variable": "$.detail.object.key",
+            "StringMatches": "loan_repayments/raw/*",
+            "Next": "TransformLoanRepayments"
+          }
+        ],
+        "Default": "UnknownFileType"
+      },
+      "TransformLoanApplications": {
+        "Type": "Task",
+        "Comment": "Transform loan applications data from Bronze to Silver",
+        "Resource": "arn:aws:states:::lambda:invoke",
+        "Parameters": {
+          "FunctionName": "${lambda_transform_loan_applications_arn}",
+          "Payload": {
+            "Records": [
+              {
+                "s3": {
+                  "bucket": {
+                    "name.$": "$.detail.bucket.name"
+                  },
+                  "object": {
+                    "key.$": "$.detail.object.key"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "ResultPath": "$.transformResult",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 2,
+            "MaxAttempts": 2,
+            "BackoffRate": 2
+          }
+        ],
+        "Catch": [
+          {
+            "ErrorEquals": ["States.ALL"],
+            "ResultPath": "$.error",
+            "Next": "HandleTransformationFailure"
+          }
+        ],
+        "Next": "CheckGlueJobStatus"
+      },
+      "TransformCreditBureau": {
+        "Type": "Task",
+        "Comment": "Transform credit bureau data from Bronze to Silver",
+        "Resource": "arn:aws:states:::lambda:invoke",
+        "Parameters": {
+          "FunctionName": "${lambda_transform_credit_bureau_arn}",
+          "Payload": {
+            "Records": [
+              {
+                "s3": {
+                  "bucket": {
+                    "name.$": "$.detail.bucket.name"
+                  },
+                  "object": {
+                    "key.$": "$.detail.object.key"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "ResultPath": "$.transformResult",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 2,
+            "MaxAttempts": 2,
+            "BackoffRate": 2
+          }
+        ],
+        "Catch": [
+          {
+            "ErrorEquals": ["States.ALL"],
+            "ResultPath": "$.error",
+            "Next": "HandleTransformationFailure"
+          }
+        ],
+        "Next": "CheckGlueJobStatus"
+      },
+      "TransformLoanRepayments": {
+        "Type": "Task",
+        "Comment": "Transform loan repayments data from Bronze to Silver",
+        "Resource": "arn:aws:states:::lambda:invoke",
+        "Parameters": {
+          "FunctionName": "${lambda_transform_loan_repayments_arn}",
+          "Payload": {
+            "Records": [
+              {
+                "s3": {
+                  "bucket": {
+                    "name.$": "$.detail.bucket.name"
+                  },
+                  "object": {
+                    "key.$": "$.detail.object.key"
+                  }
+                }
+              }
+            ]
+          }
+        },
+        "ResultPath": "$.transformResult",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Lambda.ServiceException",
+              "Lambda.AWSLambdaException",
+              "Lambda.SdkClientException",
+              "Lambda.TooManyRequestsException"
+            ],
+            "IntervalSeconds": 2,
+            "MaxAttempts": 2,
+            "BackoffRate": 2
+          }
+        ],
+        "Catch": [
+          {
+            "ErrorEquals": ["States.ALL"],
+            "ResultPath": "$.error",
+            "Next": "HandleTransformationFailure"
+          }
+        ],
+        "Next": "CheckGlueJobStatus"
+      },
+      "CheckGlueJobStatus": {
+        "Type": "Task",
+        "Comment": "Check if Glue job is currently running",
+        "Resource": "arn:aws:states:::lambda:invoke",
+        "Parameters": {
+          "FunctionName": "${lambda_check_glue_status_arn}",
+          "Payload": {
+            "glue_job_name": "${glue_job_name}"
+          }
+        },
+        "ResultPath": "$.glueStatusCheck",
+        "Next": "IsGlueJobRunning"
+      },
+      "IsGlueJobRunning": {
+        "Type": "Choice",
+        "Comment": "Determine if Glue job is available or needs to wait",
+        "Choices": [
+          {
+            "Variable": "$.glueStatusCheck.Payload.isRunning",
+            "BooleanEquals": true,
+            "Next": "WaitForGlueJobAvailability"
+          }
+        ],
+        "Default": "StartGlueJob"
+      },
+      "WaitForGlueJobAvailability": {
+        "Type": "Wait",
+        "Comment": "Wait 30 seconds before checking Glue job status again",
+        "Seconds": 30,
+        "Next": "CheckGlueJobStatus"
+      },
+      "StartGlueJob": {
+        "Type": "Task",
+        "Comment": "Start Glue job to build Gold layer (dimensions, facts, KPIs)",
+        "Resource": "arn:aws:states:::glue:startJobRun.sync",
+        "Parameters": {
+          "JobName": "${glue_job_name}"
+        },
+        "ResultPath": "$.glueJobResult",
+        "Retry": [
+          {
+            "ErrorEquals": [
+              "Glue.ConcurrentRunsExceededException",
+              "Glue.InternalServiceException"
+            ],
+            "IntervalSeconds": 60,
+            "MaxAttempts": 2,
+            "BackoffRate": 2
+          }
+        ],
+        "Catch": [
+          {
+            "ErrorEquals": ["States.ALL"],
+            "ResultPath": "$.error",
+            "Next": "HandleGlueFailure"
+          }
+        ],
+        "Next": "WorkflowSuccess"
+      },
+      "WorkflowSuccess": {
+        "Type": "Succeed",
+        "Comment": "Workflow completed successfully"
+      },
+      "UnknownFileType": {
+        "Type": "Fail",
+        "Comment": "File path does not match any known transformation pattern",
+        "Cause": "Unknown file type",
+        "Error": "InvalidFilePathError"
+      },
+      "HandleTransformationFailure": {
+        "Type": "Parallel",
+        "Comment": "Handle transformation Lambda failure by logging and notifying",
+        "Branches": [
+          {
+            "StartAt": "LogTransformationError",
+            "States": {
+              "LogTransformationError": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+                "Parameters": {
+                  "Bucket": "${silver_bucket_name}",
+                  "Key.$": "States.Format('error/step_function_transform/{}.json', $$.Execution.Name)",
+                  "Body.$": "States.JsonToString($)"
+                },
+                "End": true
+              }
+            }
+          },
+          {
+            "StartAt": "NotifyTransformationFailure",
+            "States": {
+              "NotifyTransformationFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${sns_topic_arn}",
+                  "Subject": "Credit Risk Transformation Failed",
+                  "Message.$": "States.Format('Step Function Execution Failed\n\nExecution ARN: {}\nFile: {}\nError: {}\nTimestamp: {}', $$.Execution.Name, $.detail.object.key, $.error.Error, $$.State.EnteredTime)"
+                },
+                "End": true
+              }
+            }
+          }
+        ],
+        "Next": "TransformationFailed"
+      },
+      "HandleGlueFailure": {
+        "Type": "Parallel",
+        "Comment": "Handle Glue job failure by logging and notifying",
+        "Branches": [
+          {
+            "StartAt": "LogGlueError",
+            "States": {
+              "LogGlueError": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+                "Parameters": {
+                  "Bucket": "${silver_bucket_name}",
+                  "Key.$": "States.Format('error/step_function_glue/{}.json', $$.Execution.Name)",
+                  "Body.$": "States.JsonToString($)"
+                },
+                "End": true
+              }
+            }
+          },
+          {
+            "StartAt": "NotifyGlueFailure",
+            "States": {
+              "NotifyGlueFailure": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                  "TopicArn": "${sns_topic_arn}",
+                  "Subject": "Credit Risk Glue Job Failed",
+                  "Message.$": "States.Format('Glue Job Execution Failed\n\nStep Function: {}\nGlue Job: {}\nError: {}\nTimestamp: {}', $$.Execution.Name, '${glue_job_name}', $.error.Error, $$.State.EnteredTime)"
+                },
+                "End": true
+              }
+            }
+          }
+        ],
+        "Next": "GlueJobFailed"
+      },
+      "TransformationFailed": {
+        "Type": "Fail",
+        "Comment": "Transformation Lambda failed",
+        "Cause": "Lambda transformation error"
+      },
+      "GlueJobFailed": {
+        "Type": "Fail",
+        "Comment": "Glue job execution failed",
+        "Cause": "Glue job error"
+      }
+    }
+  }
+  
